@@ -1,0 +1,327 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  IAM Roles Anywhere - External PKI Integration Sample.
+  Deploys a complete IAM Roles Anywhere setup with trust anchor,
+  IAM role (fine-grained certificate-based trust policy), Roles
+  Anywhere profile (inline session policy), monitoring alarm, and
+  optional certificate expiry notifications.
+  
+  Companion to AWS Security Blog post:
+  "Best practices for integrating IAM Roles Anywhere with your PKI"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  TrustAnchorCertificateBody:
+    Type: String
+    Description: >
+      PEM-encoded X.509 certificate of your Certificate Authority (CA)
+      to use as the trust anchor. Include the full certificate including
+      the BEGIN CERTIFICATE and END CERTIFICATE markers. For intermediate
+      CAs, include the full chain.
+    NoEcho: true
+
+  WorkloadSubjectCN:
+    Type: String
+    Description: >
+      The Subject Common Name (CN) from the workload X.509 certificate.
+      IAM Roles Anywhere extracts this from the authenticating certificate
+      and makes it available as aws:PrincipalTag/x509Subject/CN.
+    Default: WorkloadA
+    MinLength: 1
+    MaxLength: 64
+
+  WorkloadIssuerCN:
+    Type: String
+    Description: >
+      The Issuer Common Name (CN) from the CA certificate that signed
+      the workload certificate. Available as aws:PrincipalTag/x509Issuer/CN.
+    Default: MyCompany CA
+    MinLength: 1
+    MaxLength: 64
+
+  WorkloadSANCN:
+    Type: String
+    Description: >
+      The Subject Alternative Name (SAN) Common Name from the workload
+      certificate. Available as aws:PrincipalTag/x509SAN/Name/CN.
+      Provides an additional identity assertion beyond Subject CN.
+    Default: WorkloadA
+    MinLength: 1
+    MaxLength: 64
+
+  SessionDurationSeconds:
+    Type: Number
+    Description: >
+      Maximum duration (in seconds) for temporary credentials issued
+      by IAM Roles Anywhere. Shorter durations reduce exposure window.
+    Default: 3600
+    MinValue: 900
+    MaxValue: 43200
+
+  NotificationEmail:
+    Type: String
+    Description: >
+      Optional email address for certificate expiry notifications.
+      When provided, creates an SNS topic, subscription, and
+      EventBridge rule to alert before trust anchor certificate expires.
+      Leave empty to skip notification setup.
+    Default: ''
+    MaxLength: 256
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Trust Anchor - Anchors trust to your external CA
+  # ---------------------------------------------------------------------------
+  TrustAnchor:
+    Type: AWS::RolesAnywhere::TrustAnchor
+    Properties:
+      Name: !Sub ${AWS::StackName}-trust-anchor
+      Enabled: true
+      Source:
+        SourceData:
+          X509CertificateData: !Ref TrustAnchorCertificateBody
+        SourceType: CERTIFICATE_BUNDLE
+      Tags:
+        - Key: Purpose
+          Value: IAM-Roles-Anywhere-PKI-Integration
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # IAM Role - Assumable only with matching certificate attributes
+  # ---------------------------------------------------------------------------
+  WorkloadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-workload-role
+      Description: >
+        Role assumed by external workloads via IAM Roles Anywhere.
+        Trust policy restricts assumption to certificates matching
+        specific Issuer, Subject, and SAN attributes, scoped to the
+        deployed trust anchor.
+      MaxSessionDuration: !Ref SessionDurationSeconds
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rolesanywhere.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+              - sts:SetSourceIdentity
+            Condition:
+              # Certificate attribute conditions - all must match
+              StringEquals:
+                aws:PrincipalTag/x509Issuer/CN: !Ref WorkloadIssuerCN
+                aws:PrincipalTag/x509Subject/CN: !Ref WorkloadSubjectCN
+                aws:PrincipalTag/x509SAN/Name/CN: !Ref WorkloadSANCN
+              # Trust anchor scoping - prevents other trust anchors
+              # in the same account from assuming this role
+              ArnEquals:
+                aws:SourceArn: !GetAtt TrustAnchor.TrustAnchorArn
+      # Example workload permissions - replace with your actual needs
+      Policies:
+        - PolicyName: WorkloadAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowS3ReadAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub arn:aws:s3:::${AWS::StackName}-*
+                  - !Sub arn:aws:s3:::${AWS::StackName}-*/*
+              - Sid: AllowSTSGetCallerIdentity
+                Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: '*'
+      Tags:
+        - Key: Purpose
+          Value: IAM-Roles-Anywhere-Workload
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Roles Anywhere Profile - Links role with session policy
+  # ---------------------------------------------------------------------------
+  RolesAnywhereProfile:
+    Type: AWS::RolesAnywhere::Profile
+    Properties:
+      Name: !Sub ${AWS::StackName}-profile
+      Enabled: true
+      DurationSeconds: !Ref SessionDurationSeconds
+      RoleArns:
+        - !GetAtt WorkloadRole.Arn
+      # Inline session policy acts as additional boundary on all sessions
+      SessionPolicy: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "DenyUnencryptedTransport",
+              "Effect": "Deny",
+              "Action": "*",
+              "Resource": "*",
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              }
+            },
+            {
+              "Sid": "RestrictToHomeRegion",
+              "Effect": "Deny",
+              "NotAction": ["iam:*", "sts:*", "rolesanywhere:*"],
+              "Resource": "*",
+              "Condition": {
+                "StringNotEquals": {
+                  "aws:RequestedRegion": "${AWS::Region}"
+                }
+              }
+            }
+          ]
+        }
+      Tags:
+        - Key: Purpose
+          Value: IAM-Roles-Anywhere-PKI-Integration
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Monitoring - CreateSession failure alarm
+  # ---------------------------------------------------------------------------
+  RolesAnywhereAPIAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-create-session-failures
+      AlarmDescription: >
+        Alerts when IAM Roles Anywhere CreateSession calls fail,
+        indicating potential certificate validation issues, expired
+        certificates, or unauthorized access attempts.
+      Namespace: AWS/RolesAnywhere
+      MetricName: CreateSessionFailure
+      Dimensions:
+        - Name: TrustAnchorArn
+          Value: !GetAtt TrustAnchor.TrustAnchorArn
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If
+          - HasNotificationEmail
+          - !Ref CertExpiryNotificationTopic
+          - !Ref AWS::NoValue
+
+  # ---------------------------------------------------------------------------
+  # Certificate Expiry Notifications (conditional)
+  # ---------------------------------------------------------------------------
+  CertExpiryNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasNotificationEmail
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-cert-expiry-notifications
+      Tags:
+        - Key: Purpose
+          Value: Certificate-Expiry-Monitoring
+
+  CertExpirySubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref CertExpiryNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  CertExpiryEventRule:
+    Type: AWS::Events::Rule
+    Condition: HasNotificationEmail
+    Properties:
+      Name: !Sub ${AWS::StackName}-cert-expiry-rule
+      Description: >
+        Monitors IAM Roles Anywhere trust anchor certificate for
+        approaching expiry. Triggers SNS notification to allow
+        certificate rotation before service disruption.
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.health
+        detail-type:
+          - AWS Health Event
+        detail:
+          service:
+            - ROLESANYWHERE
+          eventTypeCode:
+            - AWS_ROLESANYWHERE_TRUST_ANCHOR_CERTIFICATE_APPROACHING_EXPIRY
+      Targets:
+        - Arn: !Ref CertExpiryNotificationTopic
+          Id: CertExpiryNotification
+
+  CertExpiryEventTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: HasNotificationEmail
+    Properties:
+      Topics:
+        - !Ref CertExpiryNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref CertExpiryNotificationTopic
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  TrustAnchorArn:
+    Description: ARN of the IAM Roles Anywhere Trust Anchor
+    Value: !GetAtt TrustAnchor.TrustAnchorArn
+    Export:
+      Name: !Sub ${AWS::StackName}-TrustAnchorArn
+
+  WorkloadRoleArn:
+    Description: ARN of the IAM Role for workloads to assume
+    Value: !GetAtt WorkloadRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-WorkloadRoleArn
+
+  ProfileArn:
+    Description: ARN of the IAM Roles Anywhere Profile
+    Value: !GetAtt RolesAnywhereProfile.ProfileArn
+    Export:
+      Name: !Sub ${AWS::StackName}-ProfileArn
+
+  CredentialHelperCommand:
+    Description: >
+      Example aws_signing_helper command for use in ~/.aws/config.
+      Replace certificate.pem and private-key.pem with actual paths.
+    Value: !Sub >
+      aws_signing_helper credential-process
+      --certificate /path/to/certificate.pem
+      --private-key /path/to/private-key.pem
+      --trust-anchor-arn ${TrustAnchor.TrustAnchorArn}
+      --profile-arn ${RolesAnywhereProfile.ProfileArn}
+      --role-arn ${WorkloadRole.Arn}
