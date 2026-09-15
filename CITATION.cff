@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+title: "Sample: IAM Roles Anywhere external PKI integration"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - given-names: Abhishek
+    family-names: Agawane
+  - given-names: Manoj
+    family-names: Gupta
+repository-code: "https://github.com/aws-samples/sample-iam-roles-anywhere-external-pki-integration"
+year: 2026
+license: MIT-0
