@@ -8,5 +8,5 @@ authors:
   - given-names: Manoj
     family-names: Gupta
 repository-code: "https://github.com/aws-samples/sample-iam-roles-anywhere-external-pki-integration"
-year: 2026
+date-released: "2026-09-01"
 license: MIT-0
